@@ -1,10 +1,5 @@
 """
 viewer.py  —  inference-capture dataset viewer
-------------------------------------------------
-- Groups by user message prefix (not system prompt — proxy injects same system for all)
-- Incremental polling: only appends new rows, never re-renders existing ones
-- Category naming via modal dialog (no inline DOM swapping = always works)
-- Save processed dataset with category field to server
 """
 
 import os, json, glob
@@ -46,6 +41,29 @@ def get_records(filename):
                 pass
     return jsonify(records)
 
+@app.route("/api/delete_rows", methods=["POST"])
+def delete_rows():
+    data     = request.json
+    filename = data.get("filename", "")
+    row_nums = set(data.get("rows", []))
+    if not filename or not row_nums:
+        return jsonify({"status": "error", "message": "missing filename or rows"}), 400
+    path = os.path.join(DATA_DIR, filename)
+    if not os.path.isfile(path):
+        return jsonify({"status": "error", "message": "file not found"}), 404
+    kept = []
+    with open(path, encoding="utf-8") as f:
+        for i, line in enumerate(f, 1):
+            if i in row_nums:
+                continue
+            line = line.strip()
+            if line:
+                kept.append(line)
+    with open(path, "w", encoding="utf-8") as f:
+        for line in kept:
+            f.write(line + "\n")
+    return jsonify({"status": "ok", "deleted": len(row_nums), "remaining": len(kept)})
+
 @app.route("/api/save_processed", methods=["POST"])
 def save_processed():
     data     = request.json
@@ -82,7 +100,6 @@ HTML = r"""<!DOCTYPE html>
 }
 body{background:var(--bg);color:var(--txt);font-family:var(--sans);font-size:var(--fs);height:100vh;display:flex;flex-direction:column;overflow:hidden}
 
-/* ── TOP BAR ─────────────────────────────────────────────────── */
 .topbar{height:52px;flex-shrink:0;display:flex;align-items:center;gap:10px;padding:0 18px;background:var(--surf);border-bottom:1.5px solid var(--bdr2);box-shadow:0 1px 6px rgba(0,0,0,.07)}
 .logo{font-family:var(--mono);font-size:14px;font-weight:700;letter-spacing:-.04em;white-space:nowrap}
 .logo span{color:var(--acc)}
@@ -97,12 +114,13 @@ select:focus,input[type=text]:focus{border-color:var(--acc);box-shadow:0 0 0 3px
 .btn:hover{color:var(--acc);border-color:var(--acc);background:var(--acc-l)}
 .btn.g{color:var(--grn);border-color:var(--grn);background:var(--grn-l)}
 .btn.g:hover{opacity:.85}
+.btn.danger{color:var(--red);border-color:var(--red);background:var(--red-l)}
+.btn.danger:hover{opacity:.85}
 .fsc{display:flex;align-items:center;gap:3px}
 .fsb{width:26px;height:26px;border-radius:6px;display:flex;align-items:center;justify-content:center;background:#fff;border:1px solid var(--bdr2);color:var(--txt2);cursor:pointer;font-size:14px;font-weight:700;transition:all .15s}
 .fsb:hover{color:var(--acc);border-color:var(--acc);background:var(--acc-l)}
 .fsl{font-size:11px;color:var(--txt3);font-family:var(--mono);min-width:30px;text-align:center}
 
-/* ── STATS BAR ────────────────────────────────────────────────── */
 .sbar{height:40px;flex-shrink:0;display:flex;align-items:center;gap:10px;padding:0 18px;background:var(--surf2);border-bottom:1px solid var(--bdr);font-size:12px;overflow-x:auto}
 .pill{display:flex;align-items:center;gap:4px;background:#fff;border:1px solid var(--bdr);border-radius:20px;padding:2px 9px;font-size:11px;font-family:var(--mono);white-space:nowrap;flex-shrink:0}
 .pill b{color:var(--acc)}
@@ -113,7 +131,6 @@ select:focus,input[type=text]:focus{border-color:var(--acc);box-shadow:0 0 0 3px
 .chip{background:#fff;border:1px solid var(--bdr2);border-radius:20px;padding:3px 10px;font-size:11px;font-family:var(--mono);color:var(--txt3);cursor:pointer;transition:all .15s;white-space:nowrap}
 .chip:hover,.chip.on{background:var(--acc-l);border-color:var(--acc);color:var(--acc);font-weight:600}
 
-/* ── TABLE ────────────────────────────────────────────────────── */
 .tw{flex:1;overflow:auto;scrollbar-width:thin;scrollbar-color:var(--bdr2) transparent}
 table{width:100%;border-collapse:collapse;table-layout:fixed}
 colgroup col.cs{width:34px}
@@ -130,7 +147,6 @@ th{padding:0 10px;height:38px;text-align:left;font-family:var(--mono);font-size:
 th:last-child{border-right:none}
 th.tc{text-align:center}
 
-/* ── GROUP HEADER ─────────────────────────────────────────────── */
 .gh-row{}
 .gh-cell{padding:0;border-right:none!important}
 .gh-main{display:flex;align-items:center;border-left:4px solid;height:44px}
@@ -145,11 +161,12 @@ th.tc{text-align:center}
 .gh-name.unnamed{opacity:.45;font-style:italic;font-weight:400}
 .gh-edit-btn{font-family:var(--mono);font-size:10px;font-weight:700;padding:2px 8px;border-radius:5px;border:1px dashed;background:rgba(255,255,255,.5);cursor:pointer;white-space:nowrap;flex-shrink:0;transition:all .12s;text-transform:uppercase;letter-spacing:.04em}
 .gh-edit-btn:hover{background:#fff}
+.gh-del-btn{font-family:var(--mono);font-size:10px;font-weight:700;padding:2px 8px;border-radius:5px;border:1px solid rgba(184,50,50,.4);background:rgba(255,236,236,.5);color:var(--red);cursor:pointer;white-space:nowrap;flex-shrink:0;transition:all .12s;text-transform:uppercase;letter-spacing:.04em}
+.gh-del-btn:hover{background:var(--red-l);border-color:var(--red)}
 .gh-prompt-btn{font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.45);border:1px solid rgba(0,0,0,.1);border-radius:4px;padding:2px 8px;cursor:pointer;white-space:nowrap;flex-shrink:0;margin-left:auto;transition:all .12s}
 .gh-prompt-btn:hover{background:#fff}
 .gh-panel{padding:12px 18px 14px 52px;border-top:1px solid rgba(0,0,0,.07);font-family:var(--mono);font-size:11px;color:var(--txt3);white-space:pre-wrap;line-height:1.75;max-height:220px;overflow-y:auto;border-left:4px solid}
 
-/* ── DATA ROWS ────────────────────────────────────────────────── */
 .dr{border-bottom:1px solid var(--bdr);cursor:pointer;transition:background .07s}
 .dr:hover{background:rgba(91,79,212,.04)}
 .dr.exp{background:var(--acc-l)!important}
@@ -171,7 +188,6 @@ td.ts{color:var(--txt4);font-size:11px}
 .ib:hover{color:var(--acc);border-color:var(--acc);background:var(--acc-l)}
 .ib.on{color:var(--acc);border-color:var(--acc);background:var(--acc-l)}
 
-/* ── DETAIL PANEL ─────────────────────────────────────────────── */
 .det-row td{height:auto;padding:0;border-right:none;background:#fff}
 .det-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;background:var(--bdr2);border-top:3px solid var(--acc)}
 .det-col{background:#fff;padding:12px 16px}
@@ -197,7 +213,6 @@ td.ts{color:var(--txt4);font-size:11px}
 .mr2{display:flex;align-items:baseline;gap:8px;padding:2px 0;border-bottom:1px solid var(--bdr)}
 .mr2:last-child{border-bottom:none}
 
-/* ── MODALS ───────────────────────────────────────────────────── */
 .overlay{position:fixed;inset:0;background:rgba(0,0,0,.48);z-index:300;display:flex;align-items:center;justify-content:center;animation:fi .15s ease}
 @keyframes fi{from{opacity:0}to{opacity:1}}
 .modal{background:#fff;border-radius:12px;padding:26px 28px;width:460px;box-shadow:0 20px 60px rgba(0,0,0,.22);animation:ms .15s ease}
@@ -208,7 +223,8 @@ td.ts{color:var(--txt4);font-size:11px}
 .modal-btns{display:flex;gap:7px;justify-content:flex-end}
 .name-preview{font-family:var(--mono);font-size:11px;color:var(--txt3);margin-bottom:14px;padding:8px 10px;background:var(--surf2);border-radius:6px;line-height:1.6;max-height:80px;overflow:hidden;text-overflow:ellipsis}
 
-/* ── BULK BAR ─────────────────────────────────────────────────── */
+.del-warn{background:var(--red-l);border:1px solid var(--red);border-radius:6px;padding:10px 12px;font-family:var(--mono);font-size:11px;color:var(--red);margin-bottom:14px;line-height:1.6}
+
 .bulk{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#18181e;color:#fff;border-radius:12px;padding:9px 18px;display:flex;align-items:center;gap:9px;box-shadow:0 8px 32px rgba(0,0,0,.28);z-index:100;font-size:12px;font-family:var(--mono);animation:su .15s ease}
 @keyframes su{from{transform:translateX(-50%) translateY(10px);opacity:0}to{transform:translateX(-50%) translateY(0);opacity:1}}
 .bb{background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.18);color:#fff;font-family:var(--mono);font-size:11px;font-weight:600;padding:4px 11px;border-radius:6px;cursor:pointer;transition:background .12s;white-space:nowrap}
@@ -216,9 +232,9 @@ td.ts{color:var(--txt4);font-size:11px}
 .bb.g{background:rgba(26,122,74,.5);border-color:rgba(26,122,74,.7)}
 .bb.r{background:rgba(184,50,50,.4);border-color:rgba(184,50,50,.6)}
 
-/* ── TOAST ────────────────────────────────────────────────────── */
 .toast{position:fixed;bottom:72px;right:20px;background:#18181e;color:#fff;border-radius:8px;padding:9px 14px;font-size:12px;font-family:var(--mono);box-shadow:0 4px 16px rgba(0,0,0,.2);z-index:500;animation:ti .15s ease;pointer-events:none}
 .toast.g{background:var(--grn)}
+.toast.r{background:var(--red)}
 @keyframes ti{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
 .empty{display:flex;flex-direction:column;align-items:center;justify-content:center;flex:1;gap:10px;color:var(--txt3);padding:80px}
 .empty-ico{font-size:40px}
@@ -284,6 +300,20 @@ td.ts{color:var(--txt4);font-size:11px}
   </div>
 </div>
 
+<!-- DELETE GROUP MODAL -->
+<div class="overlay" id="deleteOverlay" style="display:none" onclick="closeDeleteModal()">
+  <div class="modal" onclick="event.stopPropagation()">
+    <h3>🗑️ Delete group</h3>
+    <div class="name-preview" id="deletePreview"></div>
+    <div class="del-warn" id="deleteWarn"></div>
+    <p>This permanently removes these rows from <b id="deleteFilename"></b> on disk. This cannot be undone.</p>
+    <div class="modal-btns">
+      <button class="btn" onclick="closeDeleteModal()">Cancel</button>
+      <button class="btn danger" onclick="confirmDeleteGroup()">🗑️ Delete permanently</button>
+    </div>
+  </div>
+</div>
+
 <!-- SAVE MODAL -->
 <div class="overlay" id="saveOverlay" style="display:none" onclick="closeSaveModal()">
   <div class="modal" onclick="event.stopPropagation()">
@@ -300,7 +330,6 @@ td.ts{color:var(--txt4);font-size:11px}
 </div>
 
 <script>
-// ── STATE ─────────────────────────────────────────────────────────────────
 const COLORS = [
   {bg:'#eceaff',bdr:'#5b4fd4',txt:'#4438b0'},
   {bg:'#dff5eb',bdr:'#1a7a4a',txt:'#1a7a4a'},
@@ -313,29 +342,28 @@ const COLORS = [
 ];
 
 let currentFile = '';
-let allRecords  = [];          // all loaded records
-let lastRow     = 0;           // highest _row seen — for incremental fetch
-let groupKeys   = new Map();   // groupKey -> {gid, color, rows[]}
+let allRecords  = [];
+let lastRow     = 0;
+let groupKeys   = new Map();
 let gidSeq      = 0;
 
 let collapsed   = new Set();
 let sysOpen     = new Set();
 let selected    = new Set();
-let catNames    = {};          // groupKey -> name (persisted in localStorage)
+let catNames    = {};
 
 let filterMode  = 'all';
 let searchQ     = '';
 let fontSize    = 13;
 let pollTimer   = null;
 
-// modal state
 let editingKey  = '';
+let deletingKey = '';
 
-// ── HELPERS ──────────────────────────────────────────────────────────────
 function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') }
-function toast(msg,g){
+function toast(msg,cls){
   const t=document.createElement('div');
-  t.className='toast'+(g?' g':'');t.textContent=msg;
+  t.className='toast'+(cls?' '+cls:'');t.textContent=msg;
   document.body.appendChild(t);setTimeout(()=>t.remove(),2400);
 }
 
@@ -393,7 +421,6 @@ function applyFilter(){
   });
 }
 
-// ── FILE LOAD ─────────────────────────────────────────────────────────────
 function onFileChange(){
   const f=document.getElementById('fileSelect').value;
   if(f===currentFile) return;
@@ -432,13 +459,11 @@ async function initFiles(){
   });
 }
 
-// ── APPEND ROW (incremental — never re-renders existing rows) ─────────────
 function appendRow(r){
   const tbody=document.getElementById('tbody');
   if(!tbody) return;
   const key=getGroupKey(r);
 
-  // ensure group exists
   if(!groupKeys.has(key)){
     const gid='g'+(gidSeq++);
     const col=COLORS[(gidSeq-1)%COLORS.length];
@@ -449,10 +474,8 @@ function appendRow(r){
   grp.count++;
   updateGroupCount(grp.gid,grp.count);
 
-  // row visibility
   const hidden=collapsed.has(grp.gid);
 
-  // data row
   const tr=document.createElement('tr');
   tr.className='dr'+(hidden?' hid':'');
   tr.id='r-'+r._row;
@@ -480,12 +503,10 @@ function appendRow(r){
       </div>
     </td>`;
 
-  // insert before the NEXT group header if it exists, else append
   const nextGH=findNextGroupHeader(tbody,grp.gid);
   if(nextGH) tbody.insertBefore(tr,nextGH);
   else tbody.appendChild(tr);
 
-  // detail row (hidden by default)
   const det=document.createElement('tr');
   det.className='det-row'+(hidden?' hid':'');
   det.id='d-'+r._row;
@@ -501,7 +522,6 @@ function appendRow(r){
 }
 
 function findNextGroupHeader(tbody,gid){
-  // Returns the first group-header TR that comes AFTER gid's header
   const headers=[...tbody.querySelectorAll('tr[data-is-gh]')];
   let found=false;
   for(const h of headers){
@@ -542,15 +562,17 @@ function buildGHHTML(key,gid,col,count){
         <button class="gh-edit-btn" style="color:${col.txt};border-color:${col.bdr}"
           data-gid="${gid}" data-key="${safeKey}"
           onclick="handleNameBtn(this)">✏️ name</button>
+        <button class="gh-del-btn"
+          data-gid="${gid}" data-key="${safeKey}"
+          onclick="handleDeleteBtn(this)">🗑️ delete</button>
         <button class="gh-prompt-btn" style="color:${col.txt}" id="pbtn-${gid}"
           onclick="toggleSys('${gid}','${col.bdr}')">${isOpen?'▲ hide prompt':'▼ show prompt'}</button>
       </div>
     </div>
     <div class="gh-panel" id="panel-${gid}" style="display:${isOpen?'block':'none'};background:${col.bg};border-left-color:${col.bdr}">${esc(panelText)}</div>`;
 }
+
 function buildPanelText(key){
-  // we can't access the first row's raw input from here directly
-  // but key IS the first line of the user message, so just show it
   return 'User message starts with:\n' + key + (key.length>=120?'\n[truncated — click a row to see full input]':'');
 }
 
@@ -569,7 +591,6 @@ function refreshGroupHeader(key){
   ghRow.querySelector('td').innerHTML=buildGHHTML(key,grp.gid,grp.col,grp.count);
 }
 
-// ── GROUP CONTROLS ────────────────────────────────────────────────────────
 function toggleGroup(gid){
   const tbody=document.getElementById('tbody');
   const rows=[...tbody.querySelectorAll(`[data-gid="${gid}"]`)];
@@ -607,6 +628,70 @@ function collapseAll(){
 }
 function expandAll(){
   groupKeys.forEach((_,key)=>{ const g=groupKeys.get(key); if(g&&collapsed.has(g.gid)) toggleGroup(g.gid); });
+}
+
+// ── DELETE GROUP ──────────────────────────────────────────────────────────
+function handleDeleteBtn(btn){
+  const gid=btn.getAttribute('data-gid');
+  const key=decodeURIComponent(btn.getAttribute('data-key'));
+  openDeleteModal(gid,key);
+}
+
+function openDeleteModal(gid,key){
+  deletingKey=key;
+  const grp=groupKeys.get(key);
+  const count=grp?grp.count:0;
+  const catName=catNames[key]||'';
+  document.getElementById('deletePreview').textContent=(catName||key).slice(0,160);
+  document.getElementById('deleteWarn').textContent=`⚠ This will permanently delete ${count} row${count===1?'':'s'} from the file.`;
+  document.getElementById('deleteFilename').textContent=currentFile;
+  document.getElementById('deleteOverlay').style.display='flex';
+}
+
+function closeDeleteModal(){
+  document.getElementById('deleteOverlay').style.display='none';
+  deletingKey='';
+}
+
+async function confirmDeleteGroup(){
+  if(!deletingKey||!currentFile){ closeDeleteModal(); return; }
+  const grp=groupKeys.get(deletingKey);
+  if(!grp){ closeDeleteModal(); return; }
+
+  const rowNums=allRecords.filter(r=>getGroupKey(r)===deletingKey).map(r=>r._row);
+
+  const res=await fetch('/api/delete_rows',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({filename:currentFile, rows:rowNums})
+  });
+  const j=await res.json();
+  if(j.status!=='ok'){
+    toast('Delete failed: '+(j.message||'unknown error'),'r');
+    closeDeleteModal();
+    return;
+  }
+
+  const tbody=document.getElementById('tbody');
+  rowNums.forEach(rowNum=>{
+    selected.delete(rowNum);
+    document.getElementById('r-'+rowNum)?.remove();
+    document.getElementById('d-'+rowNum)?.remove();
+  });
+
+  const ghRow=tbody.querySelector(`tr[data-gh-gid="${grp.gid}"]`);
+  if(ghRow) ghRow.remove();
+
+  allRecords=allRecords.filter(r=>getGroupKey(r)!==deletingKey);
+  groupKeys.delete(deletingKey);
+  if(catNames[deletingKey]){ delete catNames[deletingKey]; persistCats(); }
+  collapsed.delete(grp.gid);
+  sysOpen.delete(grp.gid);
+
+  refreshStats();
+  updateBulk();
+  toast(`🗑️ Deleted ${rowNums.length} rows from ${currentFile}`,'r');
+  closeDeleteModal();
 }
 
 // ── NAME MODAL ────────────────────────────────────────────────────────────
@@ -714,7 +799,6 @@ function previewInput(raw){
   return (raw||'').slice(0,85)+((raw||'').length>85?'…':'');
 }
 
-// ── SELECTION ─────────────────────────────────────────────────────────────
 function toggleSel(row,cb){
   if(cb.checked) selected.add(row); else selected.delete(row);
   document.getElementById('r-'+row)?.classList.toggle('sel',cb.checked);
@@ -738,7 +822,6 @@ function updateBulk(){
   document.getElementById('bulk-n').textContent=n+' selected';
 }
 
-// ── COPY / EXPORT ─────────────────────────────────────────────────────────
 function cpCell(field,rowId){
   const r=allRecords.find(x=>x._row===rowId); if(!r) return;
   let val=r[field]||'';
@@ -767,16 +850,14 @@ function exportVisible(){
 }
 function exportSel(){ exportVisible(); }
 
-// ── KEYBOARD ──────────────────────────────────────────────────────────────
 document.addEventListener('keydown',e=>{
-  if(e.key==='Escape'){ closeNameModal(); closeSaveModal(); clearSel(); }
+  if(e.key==='Escape'){ closeNameModal(); closeSaveModal(); closeDeleteModal(); clearSel(); }
   if((e.ctrlKey||e.metaKey)&&e.key==='a'&&document.activeElement.tagName!=='INPUT'){e.preventDefault();selAll();}
   if((e.ctrlKey||e.metaKey)&&e.key==='c'&&selected.size>0&&document.activeElement.tagName!=='INPUT'){e.preventDefault();copySelJSON();}
   if(document.getElementById('nameOverlay').style.display!=='none'&&e.key==='Enter'){e.preventDefault();saveGroupName();}
   if(document.getElementById('saveOverlay').style.display!=='none'&&e.key==='Enter'){e.preventDefault();doSave();}
 });
 
-// ── INIT ──────────────────────────────────────────────────────────────────
 initFiles();
 setInterval(initFiles, 30000);
 </script>
