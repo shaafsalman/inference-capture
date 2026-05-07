@@ -1,517 +1,784 @@
 """
-viewer.py
----------
-Lightweight Flask web application for browsing captured inference datasets.
-
-Serves a single-page UI that reads JSONL files from the data/ directory and
-displays each record (input, chain-of-thought, answer, params, token usage)
-in a searchable, filterable table with expand-in-place detail panels.
-
-Usage:
-    python viewer.py
-    # Then open http://localhost:8003 in your browser
+viewer.py  —  inference-capture dataset viewer
+------------------------------------------------
+- Groups by user message prefix (not system prompt — proxy injects same system for all)
+- Incremental polling: only appends new rows, never re-renders existing ones
+- Category naming via modal dialog (no inline DOM swapping = always works)
+- Save processed dataset with category field to server
 """
 
-import os
-import json
-import glob
-from flask import Flask, jsonify, Response
+import os, json, glob
+from flask import Flask, jsonify, Response, request
 
-DATA_DIR = "data"
-VIEWER_PORT = 8003
+DATA_DIR   = "data"
+VIEWER_PORT = 8081
 
 app = Flask(__name__, static_folder=None)
-
 
 @app.route("/")
 def index():
     return Response(HTML, mimetype="text/html")
 
-
 @app.route("/api/files")
 def list_files():
-    """Return a sorted list of JSONL filenames found in DATA_DIR."""
     files = sorted(glob.glob(os.path.join(DATA_DIR, "*.jsonl")))
     return jsonify([os.path.basename(f) for f in files])
 
-
 @app.route("/api/records/<filename>")
 def get_records(filename):
-    """
-    Parse and return all valid JSON records from a JSONL file.
-    Each record gets a 1-based 'row' field injected for UI tracking.
-    Invalid lines are silently skipped.
-    """
     path = os.path.join(DATA_DIR, filename)
     if not os.path.isfile(path):
         return jsonify([])
+    since = int(request.args.get("since", 0))
     records = []
     with open(path, encoding="utf-8") as f:
         for i, line in enumerate(f, 1):
+            if i <= since:
+                continue
             line = line.strip()
             if not line:
                 continue
             try:
                 r = json.loads(line)
-                r["row"] = i
+                r["_row"] = i
                 records.append(r)
             except json.JSONDecodeError:
                 pass
     return jsonify(records)
 
+@app.route("/api/save_processed", methods=["POST"])
+def save_processed():
+    data     = request.json
+    filename = data.get("filename", "processed_dataset.jsonl")
+    records  = data.get("records", [])
+    if not filename.endswith(".jsonl"):
+        filename += ".jsonl"
+    path = os.path.join(DATA_DIR, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    return jsonify({"status": "ok", "path": path, "count": len(records)})
 
-# ---------------------------------------------------------------------------
-# Embedded single-page UI
-# ---------------------------------------------------------------------------
 
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Dataset Viewer</title>
+<title>inference-capture viewer</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;1,400&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-:root {
-  --bg: #f2f2f5; --surface: #eaeaee; --surface2: #e0e0e6; --surface3: #d4d4dc;
-  --border: #c8c8d0; --border2: #b4b4c0;
-  --accent: #5b4fd4; --accent-l: #ede9ff; --accent-d: #4438b0;
-  --green: #1a7a4a; --green-l: #e0f5eb;
-  --yellow: #7a5400; --yellow-l: #fef3d0;
-  --blue: #1a5fa8; --blue-l: #deeeff;
-  --red: #b83232; --red-l: #ffecec;
-  --text: #161618; --text2: #38383c; --text3: #60606a; --text4: #9898a8;
-  --mono: 'JetBrains Mono', monospace; --sans: 'Inter', sans-serif;
-  --fs: 13px; --radius: 8px;
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#f0f0f4;--surf:#e8e8ec;--surf2:#dcdce2;--surf3:#d0d0d8;
+  --bdr:#c4c4cc;--bdr2:#adadb8;
+  --acc:#5b4fd4;--acc-l:#eceaff;--acc-d:#4438b0;
+  --grn:#1a7a4a;--grn-l:#dff5eb;
+  --yel:#7a5400;--yel-l:#fef3d0;
+  --blu:#1a5fa8;--blu-l:#deeeff;
+  --red:#b83232;--red-l:#ffecec;
+  --txt:#18181c;--txt2:#36363c;--txt3:#5e5e68;--txt4:#96969e;
+  --mono:'JetBrains Mono',monospace;--sans:'Inter',sans-serif;
+  --fs:13px;--r:8px;
 }
-body { background: var(--bg); color: var(--text); font-family: var(--sans); font-size: var(--fs); height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+body{background:var(--bg);color:var(--txt);font-family:var(--sans);font-size:var(--fs);height:100vh;display:flex;flex-direction:column;overflow:hidden}
 
-.topbar { height: 54px; flex-shrink: 0; display: flex; align-items: center; gap: 12px; padding: 0 20px; background: var(--surface); border-bottom: 1px solid var(--border2); box-shadow: 0 1px 4px rgba(0,0,0,.08); }
-.logo { font-family: var(--mono); font-size: 15px; font-weight: 700; letter-spacing: -0.04em; }
-.logo span { color: var(--accent); }
-.sep { width: 1px; height: 22px; background: var(--border2); margin: 0 2px; }
-.topbar-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+/* ── TOP BAR ─────────────────────────────────────────────────── */
+.topbar{height:52px;flex-shrink:0;display:flex;align-items:center;gap:10px;padding:0 18px;background:var(--surf);border-bottom:1.5px solid var(--bdr2);box-shadow:0 1px 6px rgba(0,0,0,.07)}
+.logo{font-family:var(--mono);font-size:14px;font-weight:700;letter-spacing:-.04em;white-space:nowrap}
+.logo span{color:var(--acc)}
+.vr{width:1px;height:20px;background:var(--bdr2);flex-shrink:0}
+.topbar-r{margin-left:auto;display:flex;align-items:center;gap:6px}
 
-select, input[type=text] { background: white; border: 1px solid var(--border2); color: var(--text); font-family: var(--mono); font-size: 12px; padding: 6px 10px; border-radius: var(--radius); outline: none; transition: border-color .15s, box-shadow .15s; }
-select:focus, input[type=text]:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(91,79,212,.12); }
-#fileSelect { min-width: 230px; }
+select,input[type=text]{background:#fff;border:1px solid var(--bdr2);color:var(--txt);font-family:var(--mono);font-size:12px;padding:5px 9px;border-radius:var(--r);outline:none;transition:border-color .15s,box-shadow .15s}
+select:focus,input[type=text]:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(91,79,212,.13)}
+#fileSelect{min-width:220px}
 
-.btn { background: white; border: 1px solid var(--border2); color: var(--text2); font-family: var(--mono); font-size: 11px; font-weight: 600; padding: 6px 14px; border-radius: var(--radius); cursor: pointer; transition: all .15s; display: flex; align-items: center; gap: 5px; white-space: nowrap; }
-.btn:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-l); }
+.btn{background:#fff;border:1px solid var(--bdr2);color:var(--txt2);font-family:var(--mono);font-size:11px;font-weight:600;padding:5px 13px;border-radius:var(--r);cursor:pointer;transition:all .15s;display:flex;align-items:center;gap:4px;white-space:nowrap}
+.btn:hover{color:var(--acc);border-color:var(--acc);background:var(--acc-l)}
+.btn.g{color:var(--grn);border-color:var(--grn);background:var(--grn-l)}
+.btn.g:hover{opacity:.85}
+.fsc{display:flex;align-items:center;gap:3px}
+.fsb{width:26px;height:26px;border-radius:6px;display:flex;align-items:center;justify-content:center;background:#fff;border:1px solid var(--bdr2);color:var(--txt2);cursor:pointer;font-size:14px;font-weight:700;transition:all .15s}
+.fsb:hover{color:var(--acc);border-color:var(--acc);background:var(--acc-l)}
+.fsl{font-size:11px;color:var(--txt3);font-family:var(--mono);min-width:30px;text-align:center}
 
-.fs-controls { display: flex; align-items: center; gap: 4px; }
-.fs-btn { width: 28px; height: 28px; border-radius: 6px; display: flex; align-items: center; justify-content: center; background: white; border: 1px solid var(--border2); color: var(--text2); cursor: pointer; font-size: 15px; font-weight: 600; transition: all .15s; }
-.fs-btn:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-l); }
-.fs-label { font-size: 11px; color: var(--text3); font-family: var(--mono); min-width: 30px; text-align: center; }
+/* ── STATS BAR ────────────────────────────────────────────────── */
+.sbar{height:40px;flex-shrink:0;display:flex;align-items:center;gap:10px;padding:0 18px;background:var(--surf2);border-bottom:1px solid var(--bdr);font-size:12px;overflow-x:auto}
+.pill{display:flex;align-items:center;gap:4px;background:#fff;border:1px solid var(--bdr);border-radius:20px;padding:2px 9px;font-size:11px;font-family:var(--mono);white-space:nowrap;flex-shrink:0}
+.pill b{color:var(--acc)}
+.pill.live b{color:var(--grn);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.fw{margin-left:auto;display:flex;align-items:center;gap:5px;flex-shrink:0}
+#srch{width:230px}
+.chip{background:#fff;border:1px solid var(--bdr2);border-radius:20px;padding:3px 10px;font-size:11px;font-family:var(--mono);color:var(--txt3);cursor:pointer;transition:all .15s;white-space:nowrap}
+.chip:hover,.chip.on{background:var(--acc-l);border-color:var(--acc);color:var(--acc);font-weight:600}
 
-.stats-bar { height: 42px; flex-shrink: 0; display: flex; align-items: center; gap: 12px; padding: 0 20px; background: var(--surface2); border-bottom: 1px solid var(--border); font-size: 12px; color: var(--text3); }
-.stat-pill { display: flex; align-items: center; gap: 5px; background: white; border: 1px solid var(--border); border-radius: 20px; padding: 3px 10px; font-size: 11px; font-family: var(--mono); }
-.stat-pill b { color: var(--accent); }
-.filter-wrap { margin-left: auto; display: flex; align-items: center; gap: 6px; }
-#searchInput { width: 250px; }
-.chip { display: flex; align-items: center; gap: 4px; background: white; border: 1px solid var(--border2); border-radius: 20px; padding: 4px 11px; font-size: 11px; font-family: var(--mono); color: var(--text3); cursor: pointer; transition: all .15s; white-space: nowrap; }
-.chip:hover, .chip.active { background: var(--accent-l); border-color: var(--accent); color: var(--accent); font-weight: 600; }
+/* ── TABLE ────────────────────────────────────────────────────── */
+.tw{flex:1;overflow:auto;scrollbar-width:thin;scrollbar-color:var(--bdr2) transparent}
+table{width:100%;border-collapse:collapse;table-layout:fixed}
+colgroup col.cs{width:34px}
+colgroup col.cn{width:48px}
+colgroup col.ct{width:136px}
+colgroup col.ci{width:23%}
+colgroup col.cc{width:26%}
+colgroup col.ca{width:20%}
+colgroup col.cb{width:72px}
 
-.table-wrap { flex: 1; overflow: auto; scrollbar-width: thin; scrollbar-color: var(--border2) transparent; }
-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
-col.c-sel { width: 36px; } col.c-row { width: 50px; } col.c-ts { width: 148px; }
-col.c-input { width: 25%; } col.c-cot { width: 28%; } col.c-answer { width: 22%; }
-col.c-act { width: 76px; }
+thead{position:sticky;top:0;z-index:20}
+thead tr{background:var(--surf)}
+th{padding:0 10px;height:38px;text-align:left;font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--txt3);border-bottom:2px solid var(--bdr2);border-right:1px solid var(--bdr);white-space:nowrap;user-select:none}
+th:last-child{border-right:none}
+th.tc{text-align:center}
 
-thead { position: sticky; top: 0; z-index: 20; }
-thead tr { background: var(--surface); }
-th { padding: 0 12px; height: 40px; text-align: left; font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; color: var(--text3); border-bottom: 2px solid var(--border2); border-right: 1px solid var(--border); white-space: nowrap; user-select: none; }
-th:last-child { border-right: none; }
-th.tc { text-align: center; }
+/* ── GROUP HEADER ─────────────────────────────────────────────── */
+.gh-row{}
+.gh-cell{padding:0;border-right:none!important}
+.gh-main{display:flex;align-items:center;border-left:4px solid;height:44px}
+.gh-collapse-zone{display:flex;align-items:center;gap:9px;padding:0 14px;flex:1;min-width:0;cursor:pointer;user-select:none;height:100%;transition:filter .1s}
+.gh-collapse-zone:hover{filter:brightness(.96)}
+.gh-actions{display:flex;align-items:center;gap:6px;padding-right:14px;flex-shrink:0}
 
-tbody tr.data-row { border-bottom: 1px solid var(--border); transition: background .08s; cursor: pointer; }
-tbody tr.data-row:hover { background: rgba(91,79,212,.05); }
-tbody tr.data-row:nth-child(4n+1) { background: white; }
-tbody tr.data-row:nth-child(4n+1):hover { background: rgba(91,79,212,.05); }
-tbody tr.data-row.expanded { background: var(--accent-l) !important; }
-tbody tr.data-row.selected { background: rgba(91,79,212,.09) !important; box-shadow: inset 2px 0 0 var(--accent); }
+.gh-chev{font-size:10px;transition:transform .15s;flex-shrink:0;color:var(--txt3)}
+.gh-chev.open{transform:rotate(90deg)}
+.gh-badge{font-size:10px;font-weight:700;padding:2px 9px;border-radius:20px;border:1px solid;white-space:nowrap;flex-shrink:0;background:#fff}
+.gh-name{font-family:var(--mono);font-size:12px;font-weight:600;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.gh-name.unnamed{opacity:.45;font-style:italic;font-weight:400}
+.gh-edit-btn{font-family:var(--mono);font-size:10px;font-weight:700;padding:2px 8px;border-radius:5px;border:1px dashed;background:rgba(255,255,255,.5);cursor:pointer;white-space:nowrap;flex-shrink:0;transition:all .12s;text-transform:uppercase;letter-spacing:.04em}
+.gh-edit-btn:hover{background:#fff}
+.gh-prompt-btn{font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.45);border:1px solid rgba(0,0,0,.1);border-radius:4px;padding:2px 8px;cursor:pointer;white-space:nowrap;flex-shrink:0;margin-left:auto;transition:all .12s}
+.gh-prompt-btn:hover{background:#fff}
+.gh-panel{padding:12px 18px 14px 52px;border-top:1px solid rgba(0,0,0,.07);font-family:var(--mono);font-size:11px;color:var(--txt3);white-space:pre-wrap;line-height:1.75;max-height:220px;overflow-y:auto;border-left:4px solid}
 
-td { padding: 0 12px; height: 46px; vertical-align: middle; font-family: var(--mono); color: var(--text2); border-right: 1px solid var(--border); overflow: hidden; }
-td:last-child { border-right: none; }
-td.tc { text-align: center; }
-td.td-ts { color: var(--text4); font-size: 11px; }
+/* ── DATA ROWS ────────────────────────────────────────────────── */
+.dr{border-bottom:1px solid var(--bdr);cursor:pointer;transition:background .07s}
+.dr:hover{background:rgba(91,79,212,.04)}
+.dr.exp{background:var(--acc-l)!important}
+.dr.sel{background:rgba(91,79,212,.08)!important;box-shadow:inset 2px 0 0 var(--acc)}
+.dr.hid,.det-row.hid{display:none}
+td{padding:0 10px;height:44px;vertical-align:middle;font-family:var(--mono);color:var(--txt2);border-right:1px solid var(--bdr);overflow:hidden}
+td:last-child{border-right:none}
+td.tc{text-align:center}
+td.ts{color:var(--txt4);font-size:11px}
+.prev{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;display:block}
+.pi{color:var(--yel);font-weight:500}
+.pa{color:var(--grn);font-weight:500}
+.pc{color:var(--txt3);font-style:italic}
+.pn{color:var(--txt4);font-style:italic}
+.badge{display:inline-flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:10px;font-weight:700;padding:2px 6px;border-radius:5px;min-width:26px;background:var(--surf3);color:var(--txt3);border:1px solid var(--bdr2)}
+.chk{width:14px;height:14px;cursor:pointer;accent-color:var(--acc)}
+.acts{display:flex;align-items:center;justify-content:center;gap:3px}
+.ib{width:25px;height:25px;border-radius:5px;display:flex;align-items:center;justify-content:center;background:#fff;border:1px solid var(--bdr2);color:var(--txt3);cursor:pointer;font-size:12px;transition:all .12s}
+.ib:hover{color:var(--acc);border-color:var(--acc);background:var(--acc-l)}
+.ib.on{color:var(--acc);border-color:var(--acc);background:var(--acc-l)}
 
-.cell-preview { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; display: block; }
-.cp-input { color: var(--yellow); font-weight: 500; }
-.cp-answer { color: var(--green); font-weight: 500; }
-.cp-cot { color: var(--text3); font-style: italic; }
-.cp-none { color: var(--text4); font-style: italic; }
+/* ── DETAIL PANEL ─────────────────────────────────────────────── */
+.det-row td{height:auto;padding:0;border-right:none;background:#fff}
+.det-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;background:var(--bdr2);border-top:3px solid var(--acc)}
+.det-col{background:#fff;padding:12px 16px}
+.det-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.lbl{font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;display:flex;align-items:center;gap:7px;flex:1}
+.lbl::after{content:'';flex:1;height:1px;background:var(--bdr)}
+.li{color:var(--yel)}.lc{color:var(--txt3)}.la{color:var(--grn)}
+.cpb{font-family:var(--mono);font-size:9px;font-weight:700;padding:2px 7px;border-radius:4px;border:1px solid var(--bdr2);background:var(--surf2);color:var(--txt3);cursor:pointer;transition:all .12s;text-transform:uppercase}
+.cpb:hover{background:var(--acc-l);border-color:var(--acc);color:var(--acc)}
+.cpb.ok{background:var(--grn-l);border-color:var(--grn);color:var(--grn)}
+.dc{font-family:var(--mono);line-height:1.8;font-size:var(--fs);white-space:pre-wrap;word-break:break-word;max-height:340px;overflow-y:auto;scrollbar-width:thin}
+.di{color:var(--txt)}.dcc{color:var(--txt3);font-style:italic}.da{color:var(--grn);font-weight:500}
+.mb{margin-bottom:10px}
+.mr{font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;margin-bottom:3px;padding:2px 6px;border-radius:4px;display:inline-block}
+.r-s{background:var(--blu-l);color:var(--blu)}.r-u{background:var(--yel-l);color:var(--yel)}.r-a{background:var(--acc-l);color:var(--acc)}
+.mb-body{color:var(--txt);line-height:1.75;font-family:var(--mono);font-size:var(--fs)}
+.no-c{color:var(--txt4);font-style:italic;font-size:11px}
+.meta-grid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--bdr);border-top:1px solid var(--bdr2)}
+.ms{background:var(--surf);padding:8px 16px}
+.mt{font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--txt3);margin-bottom:5px}
+.mk{font-family:var(--mono);font-size:11px;color:var(--txt3);min-width:150px;flex-shrink:0}
+.mv{font-family:var(--mono);font-size:11px;color:var(--txt);font-weight:600}
+.mr2{display:flex;align-items:baseline;gap:8px;padding:2px 0;border-bottom:1px solid var(--bdr)}
+.mr2:last-child{border-bottom:none}
 
-.badge-row { display: inline-flex; align-items: center; justify-content: center; font-family: var(--mono); font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 5px; min-width: 28px; background: var(--surface3); color: var(--text3); border: 1px solid var(--border2); }
-.row-check { width: 15px; height: 15px; cursor: pointer; accent-color: var(--accent); }
-.row-actions { display: flex; align-items: center; justify-content: center; gap: 4px; }
-.icon-btn { width: 26px; height: 26px; border-radius: 5px; display: flex; align-items: center; justify-content: center; background: white; border: 1px solid var(--border2); color: var(--text3); cursor: pointer; font-size: 13px; transition: all .12s; flex-shrink: 0; }
-.icon-btn:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-l); }
-.icon-btn.on { color: var(--accent); border-color: var(--accent); background: var(--accent-l); }
+/* ── MODALS ───────────────────────────────────────────────────── */
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.48);z-index:300;display:flex;align-items:center;justify-content:center;animation:fi .15s ease}
+@keyframes fi{from{opacity:0}to{opacity:1}}
+.modal{background:#fff;border-radius:12px;padding:26px 28px;width:460px;box-shadow:0 20px 60px rgba(0,0,0,.22);animation:ms .15s ease}
+@keyframes ms{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
+.modal h3{font-size:15px;font-weight:700;margin-bottom:5px}
+.modal p{font-size:12px;color:var(--txt3);margin-bottom:16px;font-family:var(--mono);line-height:1.7}
+.modal input{width:100%;margin-bottom:14px;font-size:13px}
+.modal-btns{display:flex;gap:7px;justify-content:flex-end}
+.name-preview{font-family:var(--mono);font-size:11px;color:var(--txt3);margin-bottom:14px;padding:8px 10px;background:var(--surf2);border-radius:6px;line-height:1.6;max-height:80px;overflow:hidden;text-overflow:ellipsis}
 
-tr.detail-row td { height: auto; padding: 0; border-right: none; background: white; }
-.detail-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1px; background: var(--border2); border-top: 3px solid var(--accent); }
-.detail-col { background: white; padding: 14px 18px; min-height: 80px; }
-.detail-col-hdr { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
-.col-label { font-family: var(--mono); font-size: 9px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; display: flex; align-items: center; gap: 8px; flex: 1; }
-.col-label::after { content: ''; flex: 1; height: 1px; background: var(--border); }
-.lbl-i { color: var(--yellow); } .lbl-c { color: var(--text3); } .lbl-a { color: var(--green); }
-.copy-btn { font-family: var(--mono); font-size: 9px; font-weight: 700; letter-spacing: .04em; padding: 3px 8px; border-radius: 4px; border: 1px solid var(--border2); background: var(--surface2); color: var(--text3); cursor: pointer; transition: all .12s; text-transform: uppercase; white-space: nowrap; }
-.copy-btn:hover { background: var(--accent-l); border-color: var(--accent); color: var(--accent); }
-.copy-btn.ok { background: var(--green-l); border-color: var(--green); color: var(--green); }
-.detail-content { font-family: var(--mono); line-height: 1.8; font-size: var(--fs); white-space: pre-wrap; word-break: break-word; max-height: 360px; overflow-y: auto; scrollbar-width: thin; }
-.dc-i { color: var(--text); } .dc-c { color: var(--text3); font-style: italic; } .dc-a { color: var(--green); font-weight: 500; }
-.msg-block { margin-bottom: 12px; }
-.msg-role { font-size: 9px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; margin-bottom: 4px; padding: 2px 7px; border-radius: 4px; display: inline-block; }
-.r-user { background: var(--yellow-l); color: var(--yellow); }
-.r-assistant { background: var(--accent-l); color: var(--accent); }
-.r-system { background: var(--blue-l); color: var(--blue); }
-.msg-body { color: var(--text); line-height: 1.75; font-family: var(--mono); font-size: var(--fs); }
-.no-cot { color: var(--text4); font-style: italic; font-size: 11px; }
-.meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--border); border-top: 1px solid var(--border2); }
-.meta-sec { background: var(--surface); padding: 10px 18px; }
-.meta-title { font-family: var(--mono); font-size: 9px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: var(--text3); margin-bottom: 6px; }
-.meta-row { display: flex; align-items: baseline; gap: 10px; padding: 3px 0; border-bottom: 1px solid var(--border); }
-.meta-row:last-child { border-bottom: none; }
-.meta-k { font-family: var(--mono); font-size: 11px; color: var(--text3); min-width: 150px; flex-shrink: 0; }
-.meta-v { font-family: var(--mono); font-size: 11px; color: var(--text); font-weight: 600; }
+/* ── BULK BAR ─────────────────────────────────────────────────── */
+.bulk{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#18181e;color:#fff;border-radius:12px;padding:9px 18px;display:flex;align-items:center;gap:9px;box-shadow:0 8px 32px rgba(0,0,0,.28);z-index:100;font-size:12px;font-family:var(--mono);animation:su .15s ease}
+@keyframes su{from{transform:translateX(-50%) translateY(10px);opacity:0}to{transform:translateX(-50%) translateY(0);opacity:1}}
+.bb{background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.18);color:#fff;font-family:var(--mono);font-size:11px;font-weight:600;padding:4px 11px;border-radius:6px;cursor:pointer;transition:background .12s;white-space:nowrap}
+.bb:hover{background:rgba(255,255,255,.2)}
+.bb.g{background:rgba(26,122,74,.5);border-color:rgba(26,122,74,.7)}
+.bb.r{background:rgba(184,50,50,.4);border-color:rgba(184,50,50,.6)}
 
-.bulk-bar { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #1a1a20; color: white; border-radius: 12px; padding: 10px 20px; display: flex; align-items: center; gap: 10px; box-shadow: 0 8px 32px rgba(0,0,0,.28); z-index: 100; font-size: 12px; font-family: var(--mono); animation: slideUp .15s ease-out; }
-@keyframes slideUp { from { transform: translateX(-50%) translateY(10px); opacity:0; } to { transform: translateX(-50%) translateY(0); opacity:1; } }
-.bb { background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.18); color: white; font-family: var(--mono); font-size: 11px; font-weight: 600; padding: 5px 12px; border-radius: 6px; cursor: pointer; transition: background .12s; white-space: nowrap; }
-.bb:hover { background: rgba(255,255,255,.2); }
-.bb.g { background: rgba(26,122,74,.5); border-color: rgba(26,122,74,.7); }
-.bb.r { background: rgba(184,50,50,.4); border-color: rgba(184,50,50,.6); }
-
-.toast { position: fixed; bottom: 80px; right: 24px; background: #1a1a20; color: white; border-radius: 8px; padding: 10px 16px; font-size: 12px; font-family: var(--mono); box-shadow: 0 4px 16px rgba(0,0,0,.2); z-index: 200; animation: toastIn .15s ease-out; pointer-events: none; }
-.toast.g { background: var(--green); }
-@keyframes toastIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
-
-.empty { display: flex; flex-direction: column; align-items: center; justify-content: center; flex: 1; gap: 10px; color: var(--text3); font-size: 13px; padding: 80px; }
-.empty-icon { font-size: 42px; }
-@keyframes fadeIn { from { opacity:0; transform: translateY(-3px); } to { opacity:1; transform: translateY(0); } }
-tr.detail-row { animation: fadeIn .1s ease-out; }
+/* ── TOAST ────────────────────────────────────────────────────── */
+.toast{position:fixed;bottom:72px;right:20px;background:#18181e;color:#fff;border-radius:8px;padding:9px 14px;font-size:12px;font-family:var(--mono);box-shadow:0 4px 16px rgba(0,0,0,.2);z-index:500;animation:ti .15s ease;pointer-events:none}
+.toast.g{background:var(--grn)}
+@keyframes ti{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;flex:1;gap:10px;color:var(--txt3);padding:80px}
+.empty-ico{font-size:40px}
 </style>
 </head>
 <body>
 
 <div class="topbar">
   <div class="logo">inference<span>capture</span></div>
-  <div class="sep"></div>
-  <select id="fileSelect" onchange="loadFile()"><option value="">— select file —</option></select>
-  <div class="topbar-right">
-    <div class="fs-controls">
-      <button class="fs-btn" onclick="changeFontSize(-1)">−</button>
-      <span class="fs-label" id="fsLabel">13px</span>
-      <button class="fs-btn" onclick="changeFontSize(1)">+</button>
+  <div class="vr"></div>
+  <select id="fileSelect" onchange="onFileChange()"><option value="">— select file —</option></select>
+  <div class="topbar-r">
+    <div class="fsc">
+      <button class="fsb" onclick="chFS(-1)">−</button>
+      <span class="fsl" id="fsl">13px</span>
+      <button class="fsb" onclick="chFS(1)">+</button>
     </div>
-    <div class="sep"></div>
-    <button class="btn" onclick="exportRows()">⬇ export</button>
-    <button class="btn" onclick="init()">↻ refresh</button>
+    <div class="vr"></div>
+    <button class="btn" onclick="collapseAll()">⊟ collapse</button>
+    <button class="btn" onclick="expandAll()">⊞ expand</button>
+    <button class="btn g" onclick="openSaveModal()">💾 save processed</button>
+    <button class="btn" onclick="exportVisible()">⬇ export</button>
   </div>
 </div>
 
-<div class="stats-bar" id="statsBar" style="display:none">
-  <div class="stat-pill">rows <b id="statRows">0</b></div>
-  <div class="stat-pill">showing <b id="statShowing">0</b></div>
-  <div class="stat-pill">selected <b id="statSel">0</b></div>
-  <div class="filter-wrap">
-    <div class="chip active" id="chipAll" onclick="setFilter('all')">all</div>
-    <div class="chip" id="chipCot" onclick="setFilter('cot')">has cot</div>
-    <div class="chip" id="chipNoCot" onclick="setFilter('nocot')">no cot</div>
-    <input type="text" id="searchInput" placeholder="search input / cot / answer…" oninput="renderFiltered()">
+<div class="sbar" id="sbar" style="display:none">
+  <div class="pill">rows <b id="st-rows">0</b></div>
+  <div class="pill">groups <b id="st-groups">0</b></div>
+  <div class="pill">named <b id="st-named">0</b></div>
+  <div class="pill">selected <b id="st-sel">0</b></div>
+  <div class="pill live">live <b id="st-live">●</b></div>
+  <div class="fw">
+    <span class="chip on" id="c-all" onclick="setF('all')">all</span>
+    <span class="chip" id="c-cot" onclick="setF('cot')">has cot</span>
+    <span class="chip" id="c-no" onclick="setF('no')">no cot</span>
+    <input type="text" id="srch" placeholder="search…" oninput="applyFilter()">
   </div>
 </div>
 
-<div id="tableContainer" style="flex:1;display:flex;flex-direction:column;overflow:hidden;">
-  <div class="empty"><div class="empty-icon">📂</div>select a file to begin</div>
+<div id="main" style="flex:1;display:flex;flex-direction:column;overflow:hidden">
+  <div class="empty"><div class="empty-ico">📂</div>select a file to begin</div>
 </div>
 
-<div class="bulk-bar" id="bulkBar" style="display:none">
-  <span id="bulkCount">0 selected</span>
-  <button class="bb g" onclick="copySelectedJSON()">📋 copy JSONL</button>
-  <button class="bb g" onclick="exportRows()">⬇ export</button>
-  <button class="bb" onclick="selectAllVisible()">select all</button>
+<div class="bulk" id="bulk" style="display:none">
+  <span id="bulk-n">0 selected</span>
+  <button class="bb g" onclick="copySelJSON()">📋 copy JSONL</button>
+  <button class="bb g" onclick="exportSel()">⬇ export</button>
+  <button class="bb" onclick="selAll()">select all</button>
   <button class="bb r" onclick="clearSel()">✕ clear</button>
 </div>
 
+<!-- NAME MODAL -->
+<div class="overlay" id="nameOverlay" style="display:none" onclick="closeNameModal()">
+  <div class="modal" onclick="event.stopPropagation()">
+    <h3>✏️ Name this group</h3>
+    <div class="name-preview" id="namePreview"></div>
+    <input type="text" id="nameInput" placeholder="e.g. MedBullets, MedEC, HeadQA…">
+    <div class="modal-btns">
+      <button class="btn" onclick="clearGroupName()">Clear name</button>
+      <button class="btn" onclick="closeNameModal()">Cancel</button>
+      <button class="btn g" onclick="saveGroupName()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- SAVE MODAL -->
+<div class="overlay" id="saveOverlay" style="display:none" onclick="closeSaveModal()">
+  <div class="modal" onclick="event.stopPropagation()">
+    <h3>💾 Save processed dataset</h3>
+    <p>All records saved with a <b>category</b> field from your group names.<br>
+    Unnamed groups use their user-message prefix as the category.<br>
+    Written to <b>data/</b> on the server.</p>
+    <input type="text" id="saveFile" value="processed_dataset.jsonl">
+    <div class="modal-btns">
+      <button class="btn" onclick="closeSaveModal()">Cancel</button>
+      <button class="btn g" onclick="doSave()">Save to server</button>
+    </div>
+  </div>
+</div>
+
 <script>
-let allRecords = [], fontSize = 13, selectedRows = new Set(), activeFilter = 'all';
+// ── STATE ─────────────────────────────────────────────────────────────────
+const COLORS = [
+  {bg:'#eceaff',bdr:'#5b4fd4',txt:'#4438b0'},
+  {bg:'#dff5eb',bdr:'#1a7a4a',txt:'#1a7a4a'},
+  {bg:'#fff0e0',bdr:'#8a4500',txt:'#8a4500'},
+  {bg:'#deeeff',bdr:'#1a5fa8',txt:'#1a5fa8'},
+  {bg:'#f5e0ff',bdr:'#6a1a9a',txt:'#6a1a9a'},
+  {bg:'#e0f5f5',bdr:'#1a6a6a',txt:'#1a6a6a'},
+  {bg:'#ffecec',bdr:'#b83232',txt:'#b83232'},
+  {bg:'#fef3d0',bdr:'#7a5400',txt:'#7a5400'},
+];
 
-function changeFontSize(d) {
-  fontSize = Math.min(20, Math.max(10, fontSize + d));
-  document.documentElement.style.setProperty('--fs', fontSize + 'px');
-  document.getElementById('fsLabel').textContent = fontSize + 'px';
+let currentFile = '';
+let allRecords  = [];          // all loaded records
+let lastRow     = 0;           // highest _row seen — for incremental fetch
+let groupKeys   = new Map();   // groupKey -> {gid, color, rows[]}
+let gidSeq      = 0;
+
+let collapsed   = new Set();
+let sysOpen     = new Set();
+let selected    = new Set();
+let catNames    = {};          // groupKey -> name (persisted in localStorage)
+
+let filterMode  = 'all';
+let searchQ     = '';
+let fontSize    = 13;
+let pollTimer   = null;
+
+// modal state
+let editingKey  = '';
+
+// ── HELPERS ──────────────────────────────────────────────────────────────
+function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') }
+function toast(msg,g){
+  const t=document.createElement('div');
+  t.className='toast'+(g?' g':'');t.textContent=msg;
+  document.body.appendChild(t);setTimeout(()=>t.remove(),2400);
 }
 
-function setFilter(f) {
-  activeFilter = f;
-  document.getElementById('chipAll').classList.toggle('active', f==='all');
-  document.getElementById('chipCot').classList.toggle('active', f==='cot');
-  document.getElementById('chipNoCot').classList.toggle('active', f==='nocot');
-  renderFiltered();
+function getGroupKey(r){
+  try{
+    const msgs=JSON.parse(r.input);
+    if(Array.isArray(msgs)){
+      const u=msgs.find(m=>m.role==='user');
+      if(u?.content){ return u.content.split('\n')[0].trim().slice(0,120); }
+    }
+  }catch{}
+  return '__ungrouped__';
 }
 
-async function init() {
-  const sel = document.getElementById('fileSelect'), cur = sel.value;
-  const files = await fetch('/api/files').then(r=>r.json());
-  sel.innerHTML = '<option value="">— select file —</option>';
-  files.forEach(f => {
-    const o = document.createElement('option');
-    o.value = f; o.textContent = f;
-    if (f === cur) o.selected = true;
-    sel.appendChild(o);
+function catKey(){ return 'ic_cat_'+currentFile; }
+function loadCats(){ try{ catNames=JSON.parse(localStorage.getItem(catKey())||'{}'); }catch{ catNames={}; } }
+function persistCats(){ localStorage.setItem(catKey(),JSON.stringify(catNames)); refreshStats(); }
+
+function refreshStats(){
+  document.getElementById('st-rows').textContent   = allRecords.length;
+  document.getElementById('st-groups').textContent = groupKeys.size;
+  document.getElementById('st-named').textContent  = Object.keys(catNames).length;
+  document.getElementById('st-sel').textContent    = selected.size;
+}
+
+function chFS(d){
+  fontSize=Math.min(20,Math.max(10,fontSize+d));
+  document.documentElement.style.setProperty('--fs',fontSize+'px');
+  document.getElementById('fsl').textContent=fontSize+'px';
+}
+function setF(f){
+  filterMode=f;
+  ['all','cot','no'].forEach(x=>{
+    document.getElementById('c-'+x).classList.toggle('on',x===f);
   });
-  if (cur && files.includes(cur)) loadFile();
+  applyFilter();
+}
+function applyFilter(){
+  searchQ=document.getElementById('srch').value.toLowerCase().trim();
+  allRecords.forEach(r=>{
+    const rowEl =document.getElementById('r-'+r._row);
+    const detEl =document.getElementById('d-'+r._row);
+    if(!rowEl) return;
+    let show=true;
+    if(filterMode==='cot'  && !r.cot) show=false;
+    if(filterMode==='no'   &&  r.cot) show=false;
+    if(searchQ && show){
+      const hay=(r.input||'')+(r.cot||'')+(r.answer||'');
+      if(!hay.toLowerCase().includes(searchQ)) show=false;
+    }
+    const gid=rowEl.getAttribute('data-gid');
+    const inColl=collapsed.has(gid);
+    rowEl.classList.toggle('hid',!show||inColl);
+    if(detEl) detEl.classList.toggle('hid',!show||inColl||detEl.style.display==='none');
+  });
 }
 
-async function loadFile() {
-  const fn = document.getElementById('fileSelect').value;
-  selectedRows.clear(); updateBulkBar();
-  if (!fn) {
-    allRecords = [];
-    document.getElementById('statsBar').style.display = 'none';
-    document.getElementById('tableContainer').innerHTML = '<div class="empty"><div class="empty-icon">📂</div>select a file to begin</div>';
+// ── FILE LOAD ─────────────────────────────────────────────────────────────
+function onFileChange(){
+  const f=document.getElementById('fileSelect').value;
+  if(f===currentFile) return;
+  currentFile=f; lastRow=0; allRecords=[]; groupKeys.clear(); gidSeq=0;
+  collapsed.clear(); sysOpen.clear(); selected.clear(); catNames={};
+  clearInterval(pollTimer);
+  if(!f){
+    document.getElementById('sbar').style.display='none';
+    document.getElementById('main').innerHTML='<div class="empty"><div class="empty-ico">📂</div>select a file to begin</div>';
     return;
   }
-  document.getElementById('tableContainer').innerHTML = '<div class="empty"><div class="empty-icon">⏳</div>loading…</div>';
-  allRecords = await fetch(`/api/records/${encodeURIComponent(fn)}`).then(r=>r.json());
-  document.getElementById('statsBar').style.display = 'flex';
-  document.getElementById('statRows').textContent = allRecords.length;
-  renderFiltered();
+  document.getElementById('sbar').style.display='flex';
+  loadCats();
+  document.getElementById('main').innerHTML='<div class="tw"><table><colgroup><col class="cs"><col class="cn"><col class="ct"><col class="ci"><col class="cc"><col class="ca"><col class="cb"></colgroup><thead><tr><th class="tc"><input type="checkbox" class="chk" id="chkAll" onchange="toggleAll(this)"></th><th class="tc">#</th><th>Timestamp</th><th>Input</th><th>Chain of Thought</th><th>Answer</th><th class="tc">Actions</th></tr></thead><tbody id="tbody"></tbody></table></div>';
+  fetchNew();
+  pollTimer=setInterval(fetchNew, 8000);
 }
 
-function getFiltered() {
-  const q = document.getElementById('searchInput').value.toLowerCase().trim();
-  return allRecords.filter(r => {
-    if (activeFilter==='cot' && !r.cot) return false;
-    if (activeFilter==='nocot' && r.cot) return false;
-    if (!q) return true;
-    return (r.input||'').toLowerCase().includes(q) || (r.answer||'').toLowerCase().includes(q) || (r.cot||'').toLowerCase().includes(q);
+async function fetchNew(){
+  if(!currentFile) return;
+  const url=`/api/records/${encodeURIComponent(currentFile)}?since=${lastRow}`;
+  let data;
+  try{ data=await fetch(url).then(r=>r.json()); }catch{ return; }
+  if(!data.length) return;
+  data.forEach(r=>{ allRecords.push(r); if(r._row>lastRow) lastRow=r._row; appendRow(r); });
+  refreshStats();
+}
+
+async function initFiles(){
+  const sel=document.getElementById('fileSelect'), cur=sel.value;
+  const files=await fetch('/api/files').then(r=>r.json());
+  sel.innerHTML='<option value="">— select file —</option>';
+  files.forEach(f=>{
+    const o=document.createElement('option');
+    o.value=f;o.textContent=f;if(f===cur)o.selected=true;sel.appendChild(o);
   });
 }
 
-function renderFiltered() {
-  const f = getFiltered();
-  document.getElementById('statShowing').textContent = f.length;
-  renderTable(f);
+// ── APPEND ROW (incremental — never re-renders existing rows) ─────────────
+function appendRow(r){
+  const tbody=document.getElementById('tbody');
+  if(!tbody) return;
+  const key=getGroupKey(r);
+
+  // ensure group exists
+  if(!groupKeys.has(key)){
+    const gid='g'+(gidSeq++);
+    const col=COLORS[(gidSeq-1)%COLORS.length];
+    groupKeys.set(key,{gid,col,count:0});
+    insertGroupHeader(tbody,key,gid,col);
+  }
+  const grp=groupKeys.get(key);
+  grp.count++;
+  updateGroupCount(grp.gid,grp.count);
+
+  // row visibility
+  const hidden=collapsed.has(grp.gid);
+
+  // data row
+  const tr=document.createElement('tr');
+  tr.className='dr'+(hidden?' hid':'');
+  tr.id='r-'+r._row;
+  tr.setAttribute('data-gid',grp.gid);
+  tr.style.borderLeft='3px solid '+grp.col.bdr;
+  tr.onclick=()=>toggleDet(r._row);
+
+  const ip=previewInput(r.input);
+  const cp=r.cot?r.cot.slice(0,80).replace(/\n/g,' ')+(r.cot.length>80?'…':''):'';
+  const ap=(r.answer||'').slice(0,80).replace(/\n/g,' ')+((r.answer||'').length>80?'…':'');
+  const ts=(r.timestamp||'').replace('T',' ').slice(0,19);
+  const sel=selected.has(r._row);
+
+  tr.innerHTML=`
+    <td class="tc" onclick="event.stopPropagation()"><input type="checkbox" class="chk" ${sel?'checked':''} onchange="toggleSel(${r._row},this)"></td>
+    <td class="tc"><span class="badge">${r._row}</span></td>
+    <td class="ts">${esc(ts)}</td>
+    <td><span class="prev pi">${esc(ip)}</span></td>
+    <td><span class="prev ${cp?'pc':'pn'}">${cp?esc(cp):'—'}</span></td>
+    <td><span class="prev pa">${esc(ap)}</span></td>
+    <td class="tc" onclick="event.stopPropagation()">
+      <div class="acts">
+        <button class="ib" id="eb-${r._row}" onclick="toggleDet(${r._row})">+</button>
+        <button class="ib" onclick="copyRow(${r._row})">📋</button>
+      </div>
+    </td>`;
+
+  // insert before the NEXT group header if it exists, else append
+  const nextGH=findNextGroupHeader(tbody,grp.gid);
+  if(nextGH) tbody.insertBefore(tr,nextGH);
+  else tbody.appendChild(tr);
+
+  // detail row (hidden by default)
+  const det=document.createElement('tr');
+  det.className='det-row'+(hidden?' hid':'');
+  det.id='d-'+r._row;
+  det.style.display='none';
+  const dtd=document.createElement('td');
+  dtd.colSpan=7;
+  dtd.innerHTML=detHTML(r,key);
+  det.appendChild(dtd);
+  if(nextGH) tbody.insertBefore(det,nextGH);
+  else tbody.appendChild(det);
+
+  applyFilter();
 }
 
-function renderTable(records) {
-  const c = document.getElementById('tableContainer');
-  if (!records.length) { c.innerHTML = '<div class="empty"><div class="empty-icon">🔍</div>no matching records</div>'; return; }
-
-  let html = `<div class="table-wrap"><table>
-    <colgroup><col class="c-sel"><col class="c-row"><col class="c-ts"><col class="c-input"><col class="c-cot"><col class="c-answer"><col class="c-act"></colgroup>
-    <thead><tr>
-      <th class="tc"><input type="checkbox" class="row-check" id="chkAll" onchange="toggleSelectAll(this)"></th>
-      <th class="tc">#</th><th>Timestamp</th><th>Input</th><th>Chain of Thought</th><th>Answer</th>
-      <th class="tc">Actions</th>
-    </tr></thead><tbody>`;
-
-  records.forEach(r => {
-    const ip = previewInput(r.input);
-    const cp = r.cot ? r.cot.slice(0,85).replace(/\n/g,' ')+(r.cot.length>85?'…':'') : '';
-    const ap = (r.answer||'').slice(0,85).replace(/\n/g,' ')+((r.answer||'').length>85?'…':'');
-    const ts = (r.timestamp||'').replace('T',' ').slice(0,19);
-    const sel = selectedRows.has(r.row);
-    html += `
-    <tr class="data-row${sel?' selected':''}" id="row-${r.row}" onclick="toggleRow(${r.row})">
-      <td class="tc" onclick="event.stopPropagation()"><input type="checkbox" class="row-check" ${sel?'checked':''} onchange="toggleSel(${r.row},this)"></td>
-      <td class="tc"><span class="badge-row">${r.row}</span></td>
-      <td class="td-ts">${esc(ts)}</td>
-      <td><span class="cell-preview cp-input">${esc(ip)}</span></td>
-      <td><span class="cell-preview ${cp?'cp-cot':'cp-none'}">${cp?esc(cp):'—'}</span></td>
-      <td><span class="cell-preview cp-answer">${esc(ap)}</span></td>
-      <td class="tc" onclick="event.stopPropagation()">
-        <div class="row-actions">
-          <button class="icon-btn" id="btn-${r.row}" onclick="toggleRow(${r.row})" title="Expand/collapse">+</button>
-          <button class="icon-btn" onclick="copyCell('row',${r.row})" title="Copy row as JSON">📋</button>
-        </div>
-      </td>
-    </tr>
-    <tr class="detail-row" id="detail-${r.row}" style="display:none"><td colspan="7">${detailHTML(r)}</td></tr>`;
-  });
-
-  html += `</tbody></table></div>`;
-  c.innerHTML = html;
+function findNextGroupHeader(tbody,gid){
+  // Returns the first group-header TR that comes AFTER gid's header
+  const headers=[...tbody.querySelectorAll('tr[data-is-gh]')];
+  let found=false;
+  for(const h of headers){
+    if(found) return h;
+    if(h.getAttribute('data-gh-gid')===gid) found=true;
+  }
+  return null;
 }
 
-function detailHTML(r) {
-  const params = r.params||{}, usage = r.usage||{}, rid = r.row;
-  const pf = [
-    ['model', r.model||params.model],
-    ['temperature', r.temperature??params.temperature],
-    ['max_tokens', r.max_tokens??params.max_tokens],
-    ['top_p', r.top_p??params.top_p],
-    ['presence_penalty', r.presence_penalty??params.presence_penalty],
-    ['frequency_penalty', r.frequency_penalty??params.frequency_penalty],
-    ['seed', r.seed??params.seed],
-    ['stream', r.stream??params.stream],
-  ].filter(([,v]) => v!==undefined && v!==null && v!=='');
-  const uf = [
-    ['prompt_tokens', r.prompt_tokens??usage.prompt_tokens],
-    ['completion_tokens', r.completion_tokens??usage.completion_tokens],
-    ['total_tokens', r.total_tokens??usage.total_tokens],
-  ].filter(([,v]) => v!==undefined && v!==null && v!=='');
+function insertGroupHeader(tbody,key,gid,col){
+  const tr=document.createElement('tr');
+  tr.setAttribute('data-is-gh','1');
+  tr.setAttribute('data-gh-gid',gid);
+  tr.className='gh-row';
 
+  const td=document.createElement('td');
+  td.colSpan=7;
+  td.className='gh-cell';
+  td.innerHTML=buildGHHTML(key,gid,col,0);
+  tr.appendChild(td);
+  tbody.appendChild(tr);
+}
+
+function buildGHHTML(key,gid,col,count){
+  const catName=catNames[key]||'';
+  const isOpen=sysOpen.has(gid);
+  const isColl=collapsed.has(gid);
+  const panelText=buildPanelText(key);
+  const safeKey=encodeURIComponent(key);
+  return `
+    <div class="gh-main" style="background:${col.bg};border-left-color:${col.bdr}">
+      <div class="gh-collapse-zone" onclick="toggleGroup('${gid}')">
+        <span class="gh-chev${isColl?'':' open'}" id="chev-${gid}">▶</span>
+        <span class="gh-badge" style="border-color:${col.bdr};color:${col.txt}" id="cnt-${gid}">${count} rows</span>
+        <span class="gh-name${catName?'':' unnamed'}" style="color:${col.txt}" id="gname-${gid}">${catName?esc(catName):'click ✏️ to name this group'}</span>
+      </div>
+      <div class="gh-actions">
+        <button class="gh-edit-btn" style="color:${col.txt};border-color:${col.bdr}"
+          data-gid="${gid}" data-key="${safeKey}"
+          onclick="handleNameBtn(this)">✏️ name</button>
+        <button class="gh-prompt-btn" style="color:${col.txt}" id="pbtn-${gid}"
+          onclick="toggleSys('${gid}','${col.bdr}')">${isOpen?'▲ hide prompt':'▼ show prompt'}</button>
+      </div>
+    </div>
+    <div class="gh-panel" id="panel-${gid}" style="display:${isOpen?'block':'none'};background:${col.bg};border-left-color:${col.bdr}">${esc(panelText)}</div>`;
+}
+function buildPanelText(key){
+  // we can't access the first row's raw input from here directly
+  // but key IS the first line of the user message, so just show it
+  return 'User message starts with:\n' + key + (key.length>=120?'\n[truncated — click a row to see full input]':'');
+}
+
+function updateGroupCount(gid,count){
+  const el=document.getElementById('cnt-'+gid);
+  if(el) el.textContent=count+' rows';
+}
+
+function refreshGroupHeader(key){
+  const grp=groupKeys.get(key);
+  if(!grp) return;
+  const tbody=document.getElementById('tbody');
+  if(!tbody) return;
+  const ghRow=tbody.querySelector(`tr[data-gh-gid="${grp.gid}"]`);
+  if(!ghRow) return;
+  ghRow.querySelector('td').innerHTML=buildGHHTML(key,grp.gid,grp.col,grp.count);
+}
+
+// ── GROUP CONTROLS ────────────────────────────────────────────────────────
+function toggleGroup(gid){
+  const tbody=document.getElementById('tbody');
+  const rows=[...tbody.querySelectorAll(`[data-gid="${gid}"]`)];
+  const chev=document.getElementById('chev-'+gid);
+  if(collapsed.has(gid)){
+    collapsed.delete(gid);
+    rows.forEach(r=>r.classList.remove('hid'));
+    if(chev) chev.classList.add('open');
+  } else {
+    collapsed.add(gid);
+    rows.forEach(r=>{
+      r.classList.add('hid');
+      const rid=r.id?.replace('r-','');
+      if(rid&&!isNaN(rid)){ const d=document.getElementById('d-'+rid); if(d) d.style.display='none'; }
+    });
+    if(chev) chev.classList.remove('open');
+  }
+}
+
+function toggleSys(gid,bdrColor){
+  const panel=document.getElementById('panel-'+gid);
+  const btn=document.getElementById('pbtn-'+gid);
+  if(!panel) return;
+  if(sysOpen.has(gid)){
+    sysOpen.delete(gid); panel.style.display='none';
+    if(btn) btn.textContent='▼ prompt';
+  } else {
+    sysOpen.add(gid); panel.style.display='block';
+    if(btn) btn.textContent='▲ hide';
+  }
+}
+
+function collapseAll(){
+  groupKeys.forEach((_,key)=>{ const g=groupKeys.get(key); if(g&&!collapsed.has(g.gid)) toggleGroup(g.gid); });
+}
+function expandAll(){
+  groupKeys.forEach((_,key)=>{ const g=groupKeys.get(key); if(g&&collapsed.has(g.gid)) toggleGroup(g.gid); });
+}
+
+// ── NAME MODAL ────────────────────────────────────────────────────────────
+function handleNameBtn(btn){
+  const gid=btn.getAttribute('data-gid');
+  const key=decodeURIComponent(btn.getAttribute('data-key'));
+  openNameModal(gid,key);
+}
+function openNameModal(gid,key){
+  editingKey=key;
+  document.getElementById('nameInput').value=catNames[key]||'';
+  document.getElementById('namePreview').textContent=key.slice(0,160)+(key.length>160?'…':'');
+  document.getElementById('nameOverlay').style.display='flex';
+  setTimeout(()=>document.getElementById('nameInput').focus(),50);
+}
+function closeNameModal(){ document.getElementById('nameOverlay').style.display='none'; editingKey=''; }
+function saveGroupName(){
+  const val=document.getElementById('nameInput').value.trim();
+  if(val) catNames[editingKey]=val; else delete catNames[editingKey];
+  persistCats();
+  refreshGroupHeader(editingKey);
+  closeNameModal();
+  toast(val?`Named: "${val}"`:'Name cleared');
+}
+function clearGroupName(){ document.getElementById('nameInput').value=''; }
+
+// ── SAVE MODAL ────────────────────────────────────────────────────────────
+function openSaveModal(){ document.getElementById('saveOverlay').style.display='flex'; setTimeout(()=>document.getElementById('saveFile').focus(),50); }
+function closeSaveModal(){ document.getElementById('saveOverlay').style.display='none'; }
+async function doSave(){
+  const fn=document.getElementById('saveFile').value.trim()||'processed_dataset.jsonl';
+  const records=allRecords.map(r=>{ const key=getGroupKey(r); return {...r,category:catNames[key]||key}; });
+  const res=await fetch('/api/save_processed',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:fn,records})});
+  const j=await res.json();
+  closeSaveModal();
+  toast(`✓ Saved ${j.count} records → ${j.path}`,'g');
+  setTimeout(initFiles,600);
+}
+
+// ── ROW DETAIL ────────────────────────────────────────────────────────────
+function toggleDet(row){
+  const det=document.getElementById('d-'+row);
+  const rowEl=document.getElementById('r-'+row);
+  const btn=document.getElementById('eb-'+row);
+  if(!det) return;
+  const open=det.style.display!=='none';
+  det.style.display=open?'none':'table-row';
+  rowEl?.classList.toggle('exp',!open);
+  if(btn){ btn.textContent=open?'+':'−'; btn.classList.toggle('on',!open); }
+}
+
+function detHTML(r,key){
+  const p=r.params||{},u=r.usage||{},id=r._row;
+  const cat=catNames[key]||'(unnamed)';
+  const pf=[
+    ['category',cat],['model',r.model||p.model],
+    ['temperature',r.temperature??p.temperature],['max_tokens',r.max_tokens??p.max_tokens],
+    ['top_p',r.top_p??p.top_p],['rep_penalty',p.repetition_penalty],
+    ['seed',r.seed??p.seed],['stream',r.stream??p.stream],
+  ].filter(([,v])=>v!==undefined&&v!==null&&v!=='');
+  const uf=[
+    ['prompt_tokens',r.prompt_tokens??u.prompt_tokens],
+    ['completion_tokens',r.completion_tokens??u.completion_tokens],
+    ['total_tokens',r.total_tokens??u.total_tokens],
+  ].filter(([,v])=>v!==undefined&&v!==null&&v!=='');
   return `<div>
-    <div class="detail-grid">
-      <div class="detail-col">
-        <div class="detail-col-hdr">
-          <div class="col-label lbl-i">Input</div>
-          <button class="copy-btn" id="cb-input-${rid}" onclick="copyCell('input',${rid})">copy</button>
-        </div>
-        ${renderInputDetail(r.input)}
+    <div class="det-grid">
+      <div class="det-col">
+        <div class="det-hdr"><div class="lbl li">Input</div><button class="cpb" id="cb-i-${id}" onclick="cpCell('input',${id})">copy</button></div>
+        ${renderInput(r.input)}
       </div>
-      <div class="detail-col">
-        <div class="detail-col-hdr">
-          <div class="col-label lbl-c">Chain of Thought</div>
-          ${r.cot?`<button class="copy-btn" id="cb-cot-${rid}" onclick="copyCell('cot',${rid})">copy</button>`:''}
-        </div>
-        ${r.cot?`<div class="detail-content dc-c">${esc(r.cot)}</div>`:'<div class="no-cot">No chain of thought recorded</div>'}
+      <div class="det-col">
+        <div class="det-hdr"><div class="lbl lc">Chain of Thought</div>${r.cot?`<button class="cpb" id="cb-c-${id}" onclick="cpCell('cot',${id})">copy</button>`:''}</div>
+        ${r.cot?`<div class="dc dcc">${esc(r.cot)}</div>`:'<div class="no-c">No chain of thought</div>'}
       </div>
-      <div class="detail-col">
-        <div class="detail-col-hdr">
-          <div class="col-label lbl-a">Answer</div>
-          <button class="copy-btn" id="cb-answer-${rid}" onclick="copyCell('answer',${rid})">copy</button>
-        </div>
-        <div class="detail-content dc-a">${esc(r.answer||'')}</div>
+      <div class="det-col">
+        <div class="det-hdr"><div class="lbl la">Answer</div><button class="cpb" id="cb-a-${id}" onclick="cpCell('answer',${id})">copy</button></div>
+        <div class="dc da">${esc(r.answer||'')}</div>
       </div>
     </div>
     <div class="meta-grid">
-      <div class="meta-sec">
-        <div class="meta-title">Request Params</div>
-        ${pf.map(([k,v])=>`<div class="meta-row"><span class="meta-k">${k}</span><span class="meta-v">${esc(String(v))}</span></div>`).join('')||'<div class="no-cot">—</div>'}
-      </div>
-      <div class="meta-sec">
-        <div class="meta-title">Token Usage</div>
-        ${uf.map(([k,v])=>`<div class="meta-row"><span class="meta-k">${k}</span><span class="meta-v">${esc(String(v))}</span></div>`).join('')||'<div class="no-cot">—</div>'}
-      </div>
+      <div class="ms"><div class="mt">Params</div>${pf.map(([k,v])=>`<div class="mr2"><span class="mk">${k}</span><span class="mv">${esc(String(v))}</span></div>`).join('')}</div>
+      <div class="ms"><div class="mt">Token Usage</div>${uf.map(([k,v])=>`<div class="mr2"><span class="mk">${k}</span><span class="mv">${esc(String(v))}</span></div>`).join('')}</div>
     </div>
   </div>`;
 }
 
-function copyCell(field, rowId) {
-  const r = allRecords.find(x => x.row === rowId);
-  if (!r) return;
-  let val = field==='row' ? JSON.stringify(r, null, 2) : (r[field]||'');
-  if (field==='input') {
-    try { const m = JSON.parse(val); if (Array.isArray(m)) val = m.map(x=>`[${x.role}]\n${x.content}`).join('\n\n'); } catch {}
-  }
-  navigator.clipboard.writeText(val).then(() => {
-    if (field !== 'row') {
-      const btn = document.getElementById(`cb-${field}-${rowId}`);
-      if (btn) { btn.textContent='✓'; btn.classList.add('ok'); setTimeout(()=>{btn.textContent='copy';btn.classList.remove('ok');},1800); }
+function renderInput(raw){
+  try{
+    const msgs=JSON.parse(raw);
+    if(Array.isArray(msgs)) return msgs.map(m=>`<div class="mb"><div class="mr r-${m.role}">${m.role}</div><div class="mb-body dc di">${esc(m.content||'')}</div></div>`).join('');
+  }catch{}
+  return `<div class="dc di">${esc(raw||'')}`;
+}
+
+function previewInput(raw){
+  try{
+    const msgs=JSON.parse(raw);
+    if(Array.isArray(msgs)){
+      const u=msgs.find(m=>m.role==='user');
+      const c=u?u.content:(msgs[0]?.content||'');
+      return c.slice(0,85)+(c.length>85?'…':'');
     }
-    toast(field==='row'?'Row copied as JSON':`${field} copied`, field==='row'?'':'g');
+  }catch{}
+  return (raw||'').slice(0,85)+((raw||'').length>85?'…':'');
+}
+
+// ── SELECTION ─────────────────────────────────────────────────────────────
+function toggleSel(row,cb){
+  if(cb.checked) selected.add(row); else selected.delete(row);
+  document.getElementById('r-'+row)?.classList.toggle('sel',cb.checked);
+  refreshStats(); updateBulk();
+}
+function toggleAll(master){
+  allRecords.forEach(r=>{
+    if(master.checked) selected.add(r._row); else selected.delete(r._row);
+    const el=document.getElementById('r-'+r._row);
+    const cb=el?.querySelector('.chk');
+    el?.classList.toggle('sel',master.checked);
+    if(cb) cb.checked=master.checked;
+  });
+  refreshStats(); updateBulk();
+}
+function selAll(){ const master=document.getElementById('chkAll'); if(master){master.checked=true;toggleAll(master);} }
+function clearSel(){ const master=document.getElementById('chkAll'); if(master){master.checked=false;toggleAll(master);} }
+function updateBulk(){
+  const n=selected.size;
+  document.getElementById('bulk').style.display=n>0?'flex':'none';
+  document.getElementById('bulk-n').textContent=n+' selected';
+}
+
+// ── COPY / EXPORT ─────────────────────────────────────────────────────────
+function cpCell(field,rowId){
+  const r=allRecords.find(x=>x._row===rowId); if(!r) return;
+  let val=r[field]||'';
+  if(field==='input'){ try{const m=JSON.parse(val);if(Array.isArray(m))val=m.map(x=>`[${x.role}]\n${x.content}`).join('\n\n');}catch{} }
+  navigator.clipboard.writeText(val).then(()=>{
+    const btn=document.getElementById('cb-'+field[0]+'-'+rowId);
+    if(btn){btn.textContent='✓';btn.classList.add('ok');setTimeout(()=>{btn.textContent='copy';btn.classList.remove('ok');},1800);}
+    toast(field+' copied','g');
   });
 }
-
-function copySelectedJSON() {
-  const rows = allRecords.filter(r => selectedRows.has(r.row));
-  if (!rows.length) { toast('Nothing selected'); return; }
-  navigator.clipboard.writeText(rows.map(r=>JSON.stringify(r)).join('\n')).then(()=>toast(`${rows.length} row(s) copied as JSONL`,'g'));
+function copyRow(rowId){
+  const r=allRecords.find(x=>x._row===rowId); if(!r) return;
+  navigator.clipboard.writeText(JSON.stringify(r,null,2)).then(()=>toast('row copied as JSON'));
 }
-
-function exportRows() {
-  const rows = selectedRows.size>0 ? allRecords.filter(r=>selectedRows.has(r.row)) : getFiltered();
-  if (!rows.length) { toast('Nothing to export'); return; }
-  const blob = new Blob([rows.map(r=>JSON.stringify(r)).join('\n')], {type:'application/jsonl'});
-  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download='export.jsonl'; a.click();
-  toast(`Exported ${rows.length} row(s)`,'g');
+function copySelJSON(){
+  const rows=allRecords.filter(r=>selected.has(r._row));
+  if(!rows.length){toast('Nothing selected');return;}
+  navigator.clipboard.writeText(rows.map(r=>JSON.stringify(r)).join('\n')).then(()=>toast(rows.length+' rows copied','g'));
 }
-
-function toggleSel(rowId, cb) {
-  if (cb.checked) selectedRows.add(rowId); else selectedRows.delete(rowId);
-  document.getElementById(`row-${rowId}`)?.classList.toggle('selected', cb.checked);
-  updateBulkBar();
+function exportVisible(){
+  const rows=selected.size>0?allRecords.filter(r=>selected.has(r._row)):allRecords;
+  if(!rows.length){toast('Nothing to export');return;}
+  const blob=new Blob([rows.map(r=>JSON.stringify(r)).join('\n')],{type:'application/jsonl'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='export.jsonl';a.click();
+  toast('Exported '+rows.length+' rows','g');
 }
+function exportSel(){ exportVisible(); }
 
-function toggleSelectAll(master) {
-  getFiltered().forEach(r => {
-    if (master.checked) selectedRows.add(r.row); else selectedRows.delete(r.row);
-    const el = document.getElementById(`row-${r.row}`);
-    const cb = el?.querySelector('.row-check');
-    el?.classList.toggle('selected', master.checked);
-    if (cb) cb.checked = master.checked;
-  });
-  updateBulkBar();
-}
-
-function selectAllVisible() {
-  getFiltered().forEach(r => {
-    selectedRows.add(r.row);
-    const el = document.getElementById(`row-${r.row}`);
-    const cb = el?.querySelector('.row-check');
-    el?.classList.add('selected');
-    if (cb) cb.checked = true;
-  });
-  updateBulkBar();
-}
-
-function clearSel() {
-  selectedRows.clear();
-  document.querySelectorAll('.row-check').forEach(c=>c.checked=false);
-  document.querySelectorAll('.data-row').forEach(e=>e.classList.remove('selected'));
-  updateBulkBar();
-}
-
-function updateBulkBar() {
-  const n = selectedRows.size;
-  document.getElementById('statSel').textContent = n;
-  const bar = document.getElementById('bulkBar');
-  bar.style.display = n>0 ? 'flex' : 'none';
-  if (n>0) document.getElementById('bulkCount').textContent = `${n} selected`;
-}
-
-function toggleRow(row) {
-  const det = document.getElementById(`detail-${row}`);
-  const rowEl = document.getElementById(`row-${row}`);
-  const btn = document.getElementById(`btn-${row}`);
-  if (!det) return;
-  const open = det.style.display !== 'none';
-  det.style.display = open ? 'none' : 'table-row';
-  rowEl.classList.toggle('expanded', !open);
-  if (btn) { btn.textContent = open?'+':'−'; btn.classList.toggle('on', !open); }
-}
-
-function renderInputDetail(raw) {
-  try {
-    const msgs = JSON.parse(raw);
-    if (Array.isArray(msgs)) return msgs.map(m=>`<div class="msg-block"><div class="msg-role r-${m.role}">${m.role}</div><div class="msg-body detail-content dc-i">${esc(m.content||'')}</div></div>`).join('');
-  } catch {}
-  return `<div class="detail-content dc-i">${esc(raw||'')}</div>`;
-}
-
-function previewInput(raw) {
-  try {
-    const msgs = JSON.parse(raw);
-    if (Array.isArray(msgs)) { const u = msgs.find(m=>m.role==='user'); const c = u?u.content:(msgs[0]?.content||''); return c.slice(0,88)+(c.length>88?'…':''); }
-  } catch {}
-  return (raw||'').slice(0,88)+((raw||'').length>88?'…':'');
-}
-
-function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-
-function toast(msg, color) {
-  const t = document.createElement('div');
-  t.className = 'toast'+(color==='g'?' g':'');
-  t.textContent = msg;
-  document.body.appendChild(t);
-  setTimeout(()=>t.remove(), 2200);
-}
-
-document.addEventListener('keydown', e => {
-  if (e.key==='Escape') clearSel();
-  if ((e.ctrlKey||e.metaKey) && e.key==='a' && document.activeElement.tagName!=='INPUT') { e.preventDefault(); selectAllVisible(); }
-  if ((e.ctrlKey||e.metaKey) && e.key==='c' && selectedRows.size>0 && document.activeElement.tagName!=='INPUT') { e.preventDefault(); copySelectedJSON(); }
+// ── KEYBOARD ──────────────────────────────────────────────────────────────
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape'){ closeNameModal(); closeSaveModal(); clearSel(); }
+  if((e.ctrlKey||e.metaKey)&&e.key==='a'&&document.activeElement.tagName!=='INPUT'){e.preventDefault();selAll();}
+  if((e.ctrlKey||e.metaKey)&&e.key==='c'&&selected.size>0&&document.activeElement.tagName!=='INPUT'){e.preventDefault();copySelJSON();}
+  if(document.getElementById('nameOverlay').style.display!=='none'&&e.key==='Enter'){e.preventDefault();saveGroupName();}
+  if(document.getElementById('saveOverlay').style.display!=='none'&&e.key==='Enter'){e.preventDefault();doSave();}
 });
 
-init();
-// Auto-refresh the current file every 10 seconds to pick up new records.
-setInterval(()=>{ const f=document.getElementById('fileSelect').value; if(f) loadFile(); }, 10000);
+// ── INIT ──────────────────────────────────────────────────────────────────
+initFiles();
+setInterval(initFiles, 30000);
 </script>
 </body>
 </html>
