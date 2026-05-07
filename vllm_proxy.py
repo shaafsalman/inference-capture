@@ -1,23 +1,3 @@
-"""
-vllm_proxy.py
--------------
-FastAPI reverse proxy for vLLM-compatible inference servers.
-
-Intercepts every /v1/completions and /v1/chat/completions request to:
-  - Enforce a fixed set of generation parameters
-  - Inject a configurable system prompt when none is present
-  - Extract chain-of-thought (CoT) from <think>…</think> tags or
-    the reasoning_content / reasoning delta fields
-  - Detect and truncate repetition loops in streaming CoT output
-  - Persist each (input, cot, answer) triple to CSV and JSONL for
-    downstream dataset construction
-
-All other endpoints are forwarded transparently.
-
-Usage:
-    VLLM_BASE_URL=http://your-vllm-host:8000 uvicorn vllm_proxy:app --port 8080
-"""
-
 import json
 import csv
 import httpx
@@ -29,10 +9,6 @@ from fastapi.responses import StreamingResponse
 from pydantic_settings import BaseSettings
 from datetime import datetime
 
-# ---------------------------------------------------------------------------
-# Storage paths
-# ---------------------------------------------------------------------------
-
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 DATASET_FILE = os.path.join(DATA_DIR, "dataset.csv")
@@ -40,24 +16,15 @@ DATASET_JSON_FILE = os.path.join(DATA_DIR, "dataset.jsonl")
 
 row_counter = 0
 
-# ---------------------------------------------------------------------------
-# Generation parameters that are always enforced on completion requests.
-# Override these to match your model's recommended settings.
-# ---------------------------------------------------------------------------
-
 ENFORCE_PARAMS = {
     "temperature": 1.0,
     "top_p": 0.95,
-    "presence_penalty": 1.5,
     "repetition_penalty": 1.05,
-    "max_tokens": 16384,
+    "max_tokens": 8000,
 }
 
-# Prompts above this estimated token count disable thinking to avoid
-# context-length / latency issues with long inputs.
 THINKING_TOKEN_THRESHOLD = 1500
 
-# Default system prompts — edit to suit your use case.
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant. "
     "Think briefly before answering — keep your reasoning concise. "
@@ -65,21 +32,11 @@ SYSTEM_PROMPT = (
 )
 SYSTEM_PROMPT_NO_THINK = "You are a helpful AI assistant."
 
-# ---------------------------------------------------------------------------
-# CoT tag constants and repetition-detection settings
-# ---------------------------------------------------------------------------
-
 THINK_OPEN = "<think>"
 THINK_CLOSE = "</think>"
 
-# Rolling window (chars) used to detect a stuck-loop in streamed output.
 REPEAT_WINDOW = 60
-# If the tail of the window has <= this many unique characters, it's a loop.
 REPEAT_UNIQUE_THRESHOLD = 3
-
-# ---------------------------------------------------------------------------
-# CSV column order
-# ---------------------------------------------------------------------------
 
 CSV_FIELDS = [
     "timestamp", "row", "model", "input", "cot", "answer",
@@ -88,10 +45,6 @@ CSV_FIELDS = [
     "presence_penalty", "stop", "seed", "stream",
 ]
 
-
-# ---------------------------------------------------------------------------
-# Configuration (reads from environment variables)
-# ---------------------------------------------------------------------------
 
 class Settings(BaseSettings):
     vllm_base_url: str = "http://localhost:8000"
@@ -121,12 +74,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="inference-capture proxy", lifespan=lifespan)
 
 
-# ---------------------------------------------------------------------------
-# Repetition / loop detection helpers
-# ---------------------------------------------------------------------------
-
 def is_looping(text: str) -> bool:
-    """Return True if the tail of *text* looks like a character-level loop."""
     if len(text) < REPEAT_WINDOW:
         return False
     tail = text[-REPEAT_WINDOW:]
@@ -134,7 +82,6 @@ def is_looping(text: str) -> bool:
 
 
 def clean_cot(text: str) -> str:
-    """Strip trailing repetition loops from a chain-of-thought string."""
     if not text:
         return text
     lines = text.splitlines()
@@ -148,12 +95,7 @@ def clean_cot(text: str) -> str:
     return "\n".join(clean).strip()
 
 
-# ---------------------------------------------------------------------------
-# CoT extraction helpers
-# ---------------------------------------------------------------------------
-
 def split_cot_and_answer(text: str) -> tuple[str, str]:
-    """Split inline <think>…</think> text into (cot, answer)."""
     if THINK_CLOSE in text:
         parts = text.split(THINK_CLOSE, 1)
         cot = parts[0].replace(THINK_OPEN, "").strip()
@@ -163,17 +105,11 @@ def split_cot_and_answer(text: str) -> tuple[str, str]:
 
 
 def extract_cot_and_answer(reasoning: str, content: str) -> tuple[str, str]:
-    """
-    Resolve CoT and answer from either:
-      - a dedicated reasoning field (reasoning / reasoning_content), or
-      - inline <think>…</think> tags inside the content string.
-    """
     reasoning = (reasoning or "").strip()
     content = (content or "").strip()
     if reasoning:
         return clean_cot(reasoning), content
     if THINK_CLOSE in content:
-        # Normalise: ensure content starts with the opening tag before splitting.
         if not content.startswith(THINK_OPEN):
             content = THINK_OPEN + content
         cot, answer = split_cot_and_answer(content)
@@ -182,12 +118,6 @@ def extract_cot_and_answer(reasoning: str, content: str) -> tuple[str, str]:
 
 
 def process_completion_response(data: dict) -> tuple[dict, str, str]:
-    """
-    Post-process a non-streaming completion response:
-      - Extract CoT and clean answer from each choice
-      - Strip reasoning fields from the response so clients only see the answer
-    Returns (modified_data, cot, answer).
-    """
     cot, answer = "", ""
     for choice in data.get("choices", []):
         if "message" in choice:
@@ -204,21 +134,12 @@ def process_completion_response(data: dict) -> tuple[dict, str, str]:
     return data, cot, answer
 
 
-# ---------------------------------------------------------------------------
-# Request manipulation helpers
-# ---------------------------------------------------------------------------
-
 def estimate_tokens(body: dict) -> int:
-    """Rough token estimate: 1 token ≈ 4 characters."""
     text = extract_input_text(body)
     return len(text) // 4
 
 
 def enforce_request(body: dict) -> dict:
-    """
-    Apply ENFORCE_PARAMS to the request body and inject a system prompt if
-    none exists. Disables thinking for prompts above THINKING_TOKEN_THRESHOLD.
-    """
     body = dict(body)
     for k, v in ENFORCE_PARAMS.items():
         body[k] = v
@@ -226,15 +147,14 @@ def enforce_request(body: dict) -> dict:
     large_prompt = estimate_tokens(body) > THINKING_TOKEN_THRESHOLD
 
     if large_prompt:
-        body.setdefault("extra_body", {})
-        body["extra_body"]["chat_template_kwargs"] = {"enable_thinking": False}
+        body["chat_template_kwargs"] = {"enable_thinking": False}
         body["temperature"] = 0.7
         body["top_p"] = 0.8
-        body["presence_penalty"] = 1.5
         body["repetition_penalty"] = 1.05
         system = SYSTEM_PROMPT_NO_THINK
         logger.info(f"Large prompt ({estimate_tokens(body)} est. tokens) — thinking disabled")
     else:
+        body["chat_template_kwargs"] = {"enable_thinking": True}
         system = SYSTEM_PROMPT
 
     if "messages" in body:
@@ -245,24 +165,17 @@ def enforce_request(body: dict) -> dict:
 
 
 def extract_input_text(body: dict) -> str:
-    """Return the raw input text from a request body (messages or prompt)."""
     if "messages" in body:
         return json.dumps(body["messages"])
     return body.get("prompt", "")
 
 
 def extract_request_params(body: dict) -> dict:
-    """Return generation parameters from the request body, excluding payload keys."""
     skip = {"messages", "prompt", "stream"}
     return {k: v for k, v in body.items() if k not in skip and v is not None}
 
 
-# ---------------------------------------------------------------------------
-# Persistence
-# ---------------------------------------------------------------------------
-
 def save_pair(input_text: str, cot: str, answer: str, params: dict, usage: dict) -> int:
-    """Append one (input, cot, answer) record to the CSV and JSONL files."""
     global row_counter
     row_counter += 1
     idx = row_counter
@@ -297,7 +210,6 @@ def save_pair(input_text: str, cot: str, answer: str, params: dict, usage: dict)
 
 
 def log_pair(endpoint: str, body: dict, cot: str, answer: str, row_idx: int):
-    """Pretty-print a captured (input, cot, answer) triple to the logger."""
     D, d = "=" * 72, "-" * 72
     logger.info(f"{D}\n  ROW #{row_idx}  |  {endpoint}\n{D}")
     logger.info(f"  INPUT\n{d}")
@@ -320,17 +232,8 @@ def log_pair(endpoint: str, body: dict, cot: str, answer: str, row_idx: int):
     logger.info(D)
 
 
-# ---------------------------------------------------------------------------
-# Proxy routes
-# ---------------------------------------------------------------------------
-
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy(request: Request, path: str):
-    """
-    Catch-all proxy handler.
-    Completion endpoints get parameter enforcement and CoT extraction;
-    all other endpoints are forwarded verbatim.
-    """
     url = f"{settings.vllm_base_url}/{path}"
     body = None
     body_bytes = await request.body()
@@ -357,6 +260,9 @@ async def proxy(request: Request, path: str):
     response = await http_client.request(
         method=request.method, url=url, headers=headers, content=body_bytes
     )
+
+    if response.status_code != 200:
+        logger.error(f"Upstream {response.status_code}: {response.text}")
 
     if is_completion and response.status_code == 200:
         try:
@@ -390,19 +296,11 @@ async def handle_streaming(
     client: httpx.AsyncClient, method: str, url: str,
     headers: dict, body: bytes, body_parsed: dict, path: str,
 ):
-    """
-    Stream a completion response back to the client while accumulating
-    CoT and answer text for persistence at stream end ([DONE]).
-
-    Handles two CoT formats:
-      1. Dedicated reasoning delta fields (reasoning / reasoning_content)
-      2. Inline <think>…</think> tags inside the content stream
-    """
     accumulated_cot = ""
     accumulated_answer = ""
-    using_reasoning_parser = False  # True once a reasoning delta is seen
-    inline_buffer = ""              # Holds content before </think> closes
-    cot_done = False                # True once </think> has been flushed
+    using_reasoning_parser = False
+    inline_buffer = ""
+    cot_done = False
     stream_usage = {}
 
     async def generate():
@@ -453,7 +351,6 @@ async def handle_streaming(
                 content_chunk = delta.get("content") or choice.get("text") or ""
 
                 if reasoning_chunk:
-                    # Model uses dedicated reasoning fields — accumulate silently.
                     using_reasoning_parser = True
                     if not is_looping(accumulated_cot):
                         accumulated_cot += reasoning_chunk
@@ -464,13 +361,11 @@ async def handle_streaming(
                     continue
 
                 if using_reasoning_parser:
-                    # Reasoning is already captured; forward content as-is.
                     accumulated_answer += content_chunk
                     yield f"data: {json.dumps(data)}\n"
                     continue
 
                 if not cot_done:
-                    # Buffer content until we see </think>.
                     inline_buffer += content_chunk
                     if THINK_CLOSE in inline_buffer:
                         cot_done = True
@@ -494,7 +389,6 @@ async def handle_streaming(
 
 @app.get("/health")
 async def health():
-    """Liveness check endpoint."""
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
 
